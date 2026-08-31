@@ -1,7 +1,7 @@
 ARG BASE_IMAGE=registry.access.redhat.com/ubi9-micro:latest
 
 
-FROM registry.access.redhat.com/ubi9/go-toolset:9.8-1786971605 AS builder
+FROM registry.access.redhat.com/ubi9/go-toolset:9.8-1787774815 AS builder
 
 ARG APP_VERSION="0.0.0-dev"
 # Install make as root (UBI9 go-toolset doesn't include it), then switch back to non-root.
