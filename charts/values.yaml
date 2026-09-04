@@ -22,13 +22,18 @@ serviceAccount:
 rbac:
   # -- Create RBAC resources (ClusterRole, ClusterRoleBinding)
   create: true
-  # -- ClusterRole rules - the controller needs broad permissions to apply any resource type
-  # WARNING: These broad permissions allow the applier to manage any Kubernetes resource.
-  # Future change to reduce the permissions
+  # -- ClusterRole rules - the controller needs broad permissions to apply any resource type.
+  # Wildcards are required because the applier dynamically manages arbitrary resource types
+  # (including CRDs) determined at runtime by desires in the Redis store.
+  # Verb breakdown by controller:
+  #   ApplyDesire:  create, patch (server-side apply)
+  #   DeleteDesire: get, delete
+  #   ReadDesire:   get, list, watch (dynamic informers)
+  # "update" is intentionally excluded — the applier uses SSA (patch), never full PUT.
   rules:
     - apiGroups: ["*"]
       resources: ["*"]
-      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      verbs: ["get", "list", "watch", "create", "patch", "delete"]
 
 # -- Annotations to add to controller pods
 podAnnotations: {}

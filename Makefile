@@ -17,17 +17,27 @@ LDFLAGS := -s -w \
 	-X main.commit=$(GIT_SHA) \
 	-X main.date=$(BUILD_DATE)
 
-# Version information
-CGO_ENABLED ?= 1
-GOEXPERIMENT ?= boringcrypto
 
 CONFIG ?= configs/applier.yaml
 KUBE_CONFIG_PATH ?= $(if $(KUBECONFIG),$(KUBECONFIG),$(HOME)/.kube/config)
+
+# Go tool info
+
+LOCALBIN ?= $(shell pwd)/bin
+$(LOCALBIN):
+	mkdir -p $(LOCALBIN)
+
 
 # Invoke a pinned tool: $(call gotool,name)
 # All tools share tools/go.mod with Go 1.24+ tool directives.
 TOOL_MOD := tools/go.mod
 gotool = "$(GO)" tool -modfile="$(TOOL_MOD)" $(1)
+
+# Tool shortcuts
+HELM_DOCS := $(call gotool,helm-docs)
+GOLANGCI_LINT := $(call gotool,golangci-lint)
+SETUP_ENVTEST := $(call gotool,setup-envtest)
+
 
 .PHONY: help
 help: ## Display this help
@@ -35,9 +45,11 @@ help: ## Display this help
 
 ##@ Development
 
+CGO_ENABLED ?= 1
+
 .PHONY: build
-build: ## Build the applier binary
-	CGO_ENABLED=$(CGO_ENABLED) GOEXPERIMENT=$(GOEXPERIMENT) $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BINARY_PATH) ./cmd
+build: ## Build the applier binary	
+	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BINARY_PATH) ./cmd
 
 .PHONY: run
 run: build ## Run the applier service
@@ -49,14 +61,16 @@ run: build ## Run the applier service
 test: ## Run unit tests
 	$(GO) test -v -race -coverprofile=coverage.out ./...
 
-.PHONY: test-envtest
-test-envtest: ## Run envtest-backed integration tests against a real kube-apiserver
-	@assets=$$($(call gotool,setup-envtest) use -p path $(ENVTEST_K8S_VERSION)); \
-	if [ -z "$$assets" ]; then \
-		echo "setup-envtest: failed to resolve assets for $(ENVTEST_K8S_VERSION)"; \
-		exit 1; \
-	fi; \
-	KUBEBUILDER_ASSETS="$$assets" $(GO) test -race -tags envtest ./... -run Envtest -v
+# Removal of -i to the setup-envtest command is intentional
+# If we run this envtest in CI, we want to load them from the $(PWD)/bin since we don't have access to the home directory.
+# Without --bin-dir and -i setup-envtest installs the binaries in ~/.local/share/kubebuilder-envtest/
+.PHONY: setup-envtest
+setup-envtest: $(LOCALBIN) ## Download the envtest binaries (etcd, kube-apiserver) into the local bin directory.
+	$(SETUP_ENVTEST) use '$(ENVTEST_K8S_VERSION)' --bin-dir $(LOCALBIN) -p path
+
+.PHONY: envtest
+envtest: fmt vet setup-envtest ## Run envtest-backed integration tests against a real kube-apiserver
+	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use '$(ENVTEST_K8S_VERSION)' --bin-dir $(LOCALBIN) -p path)" go test -race -tags envtest ./... -run Envtest -v
 
 .PHONY: fmt
 fmt: ## Format Go code
@@ -83,7 +97,7 @@ go-vet: vet ## Alias for vet
 
 .PHONY: lint
 lint: ## Run golangci-lint
-	$(call gotool,golangci-lint) run
+	$(GOLANGCI_LINT) run
 
 .PHONY: verify
 verify: fmt-check vet helm-verify ## Run all verification checks
@@ -115,7 +129,8 @@ download: ## Download dependencies
 # =============================================================================
 # Image Configuration
 # =============================================================================
-IMAGE_REGISTRY ?= quay.io/openshift-hyperfleet
+QUAY_REPO := openshift-hyperfleet
+IMAGE_REGISTRY ?= quay.io/$(QUAY_REPO)
 IMAGE_NAME ?= hyperfleet-applier
 IMAGE_TAG ?= $(APP_VERSION)
 IMG ?= $(IMAGE_REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
@@ -144,11 +159,12 @@ image: check-container-tool ## Build container image with configurable registry/
 	@echo "Building container image $(IMG)..."
 	$(CONTAINER_TOOL) build \
 		--platform $(PLATFORM) \
+		--build-arg GIT_SHA=$(GIT_SHA) \
+		--build-arg BUILD_DATE=$(BUILD_DATE) \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
 		--build-arg APP_VERSION=$(APP_VERSION) \
 		-t $(IMG) .
 	@echo "Image built: $(IMG)"
-	@echo "$(IMG)"
 
 .PHONY: image-push
 image-push: check-container-tool ## Push container image to registry
@@ -156,23 +172,33 @@ image-push: check-container-tool ## Push container image to registry
 	$(CONTAINER_TOOL) push $(IMG)
 	@echo "Image pushed: $(IMG)"
 
+.PHONY: check-quay-user
+check-quay-user:
+ifeq ($(strip $(QUAY_USER)),)
+	@echo "Error: QUAY_USER is not set"
+	@echo ""
+	@echo "Usage: QUAY_USER=myuser make image-dev"
+	@exit 1
+endif
 
 # Usage: QUAY_USER=myuser make image-dev
 # Dev image configuration - set QUAY_USER to push to personal registry
 DEV_TAG ?= dev-$(GIT_SHA)
 QUAY_USER ?=
 DEV_BASE_IMAGE ?= registry.access.redhat.com/ubi9/ubi-minimal:latest
+
 .PHONY: image-dev
-image-dev: IMAGE_REGISTRY = quay.io/$(QUAY_USER)
+image-dev: QUAY_REPO = $(QUAY_USER)
 image-dev: IMAGE_TAG = $(DEV_TAG)
 image-dev: BASE_IMAGE = $(DEV_BASE_IMAGE)
-image-dev: check-container-tool image image-push
+image-dev: check-quay-user image image-push ## Build and push dev image to dev Quay registry (requires QUAY_USER)
 
-##@ Helm
 
-HELM ?= helm
+##@ Helm Targets
+
+HELM := helm
+HELM_CHECK := $(shell command -v $(HELM) 2>/dev/null)
 CHART_DIR := charts
-CHART_VALUES_FILE := charts/values.yaml
 
 # Test values for helm template rendering
 HELM_TEST_VALUES := \
@@ -200,16 +226,20 @@ helm-template-check: ## Verify Helm chart templates can be rendered
 	@echo "✓ Helm chart templates rendered successfully"
 
 .PHONY: helm-verify
-helm-verify: helm-lint helm-template-check verify-helm-docs ## Run all Helm chart verification checks
-	@echo "✓ All Helm chart checks passed"
+helm-verify: ## Helm checks (helm lint, helm template, verify helm-docs)
+	@if [ -z "$(HELM_CHECK)" ]; then \
+		echo "WARNING: helm not installed. Please install it to verify Helm chart documentation." ; \
+	else \
+		$(MAKE) helm-lint helm-template-check verify-helm-docs; \
+	fi
 
 .PHONY: helm-docs
 helm-docs: ## Generate Helm chart README from values.yaml annotations
-	$(call gotool,helm-docs) --chart-search-root=charts --sort-values-order=file
+	$(HELM_DOCS) --chart-search-root=charts --sort-values-order=file
 
 .PHONY: verify-helm-docs
 verify-helm-docs: ## Verify chart README is up to date
-	$(call gotool,helm-docs) --chart-search-root=charts --sort-values-order=file
+	$(HELM_DOCS) --chart-search-root=charts --sort-values-order=file
 	@git diff --exit-code charts/README.md > /dev/null 2>&1 || \
 		(echo "ERROR: charts/README.md is out of date. Run 'make helm-docs' and commit the result." && exit 1)
 

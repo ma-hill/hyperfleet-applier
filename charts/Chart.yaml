@@ -11,3 +11,5 @@ keywords:
 home: https://github.com/openshift-hyperfleet/hyperfleet-applier
 maintainers:
   - name: HyperFleet Team
+    email: hyperfleet-team@redhat.com
+    url: https://github.com/openshift-hyperfleet

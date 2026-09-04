@@ -10,7 +10,7 @@ HyperFleet Applier - Kubernetes controller for reconciling ApplyDesire and Delet
 
 | Name | Email | Url |
 | ---- | ------ | --- |
-| HyperFleet Team |  |  |
+| HyperFleet Team | <hyperfleet-team@redhat.com> | <https://github.com/openshift-hyperfleet> |
 
 ## Values
 
@@ -23,7 +23,7 @@ HyperFleet Applier - Kubernetes controller for reconciling ApplyDesire and Delet
 | serviceAccount.annotations | object | `{}` | Annotations to add to the service account |
 | serviceAccount.name | string | `""` | Override the service account name |
 | rbac.create | bool | `true` | Create RBAC resources (ClusterRole, ClusterRoleBinding) |
-| rbac.rules | list | `[{"apiGroups":["*"],"resources":["*"],"verbs":["get","list","watch","create","update","patch","delete"]}]` | ClusterRole rules - the controller needs broad permissions to apply any resource type WARNING: These broad permissions allow the applier to manage any Kubernetes resource. Future change to reduce the permissions |
+| rbac.rules | list | `[{"apiGroups":["*"],"resources":["*"],"verbs":["get","list","watch","create","patch","delete"]}]` | ClusterRole rules - the controller needs broad permissions to apply any resource type. Wildcards are required because the applier dynamically manages arbitrary resource types (including CRDs) determined at runtime by desires in the Redis store. Verb breakdown by controller:   ApplyDesire:  create, patch (server-side apply)   DeleteDesire: get, delete   ReadDesire:   get, list, watch (dynamic informers) "update" is intentionally excluded — the applier uses SSA (patch), never full PUT. |
 | podAnnotations | object | `{}` | Annotations to add to controller pods |
 | podLabels | object | `{}` | Labels to add to controller pods |
 | podSecurityContext | object | `{"runAsNonRoot":true,"seccompProfile":{"type":"RuntimeDefault"}}` | Pod-level security context |

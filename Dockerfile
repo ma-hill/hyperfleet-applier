@@ -1,9 +1,12 @@
 ARG BASE_IMAGE=registry.access.redhat.com/ubi9-micro:latest
 
-
 FROM registry.access.redhat.com/ubi9/go-toolset:9.8-1787774815 AS builder
 
+ARG GIT_SHA=unknown
+ARG GIT_DIRTY=""
+ARG BUILD_DATE=""
 ARG APP_VERSION="0.0.0-dev"
+
 # Install make as root (UBI9 go-toolset doesn't include it), then switch back to non-root.
 USER root
 RUN dnf install -y make && dnf clean all
@@ -21,10 +24,11 @@ RUN --mount=type=cache,target=/opt/app-root/src/go/pkg/mod,uid=1001 \
 
 COPY --chown=1001:0 . .
 
-# For FIPS-compliant builds, use CGO_ENABLED=1 + GOEXPERIMENT=boringcrypto.
 RUN --mount=type=cache,target=/opt/app-root/src/go/pkg/mod,uid=1001 \
     --mount=type=cache,target=/opt/app-root/src/.cache/go-build,uid=1001 \
-    GOOS=linux make build
+    GOOS=linux CGO_ENABLED=0 \
+    GIT_SHA=${GIT_SHA} BUILD_DATE=${BUILD_DATE} APP_VERSION=${APP_VERSION} \
+    make build
 
 # Runtime stage
 FROM ${BASE_IMAGE}
@@ -41,7 +45,6 @@ USER 65532:65532
 ENTRYPOINT ["/app/hyperfleet-applier"]
 
 ARG APP_VERSION="0.0.0-dev"
-
 LABEL name="hyperfleet-applier" \
       vendor="Red Hat, Inc." \
       version="${APP_VERSION}" \
