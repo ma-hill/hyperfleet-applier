@@ -222,8 +222,9 @@ func TestEnvtest_DeleteDesire_NewCRDResolvedAutomatically(t *testing.T) {
 
 	go func() { _ = r.Start(ctx) }()
 
-	// 1. The Widget CRD doesn't exist yet
-	waitForDeleteReason(t, ctx, store, id, desire.ReasonDeleted)
+	// 1. The Widget CRD doesn't exist yet: GVR resolution fails even after
+	// setupResourceClient's own internal Reset()-and-retry.
+	waitForDeleteReason(t, ctx, store, id, desire.ReasonPreCheckFailed)
 
 	// 2. Install the CRD and create a real Widget instance.
 	installWidgetCRD(t, deleteWidgetGVR, apiextensionsv1.NamespaceScoped)
@@ -234,5 +235,7 @@ func TestEnvtest_DeleteDesire_NewCRDResolvedAutomatically(t *testing.T) {
 	}}
 	createTarget(t, ctx, deleteWidgetGVR, defaultNamespace, widget)
 
-	waitForNotFound(t, ctx, deleteWidgetGVR, defaultNamespace, name)
+	// 3. No external Reset() - setupResourceClient's own internal retry
+	// picks up the new CRD on a later pass.
+	waitForDeleteReason(t, ctx, store, id, desire.ReasonDeleted)
 }

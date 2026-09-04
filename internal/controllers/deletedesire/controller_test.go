@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/openshift-hyperfleet/hyperfleet-applier/pkg/desire"
 	"github.com/openshift-hyperfleet/hyperfleet-applier/pkg/desire/store/memory"
@@ -36,6 +37,27 @@ func (notifyingSpecLister) GetDeleteDesire(
 const (
 	rbacGroup = "rbac.authorization.k8s.io"
 )
+
+// completedDeleteSpecStore makes the re-check GetDeleteDesire report doneID as
+// already Deleted, simulating a concurrent update completing the deletion after
+// the desire was listed but before this pass reaches it.
+type completedDeleteSpecStore struct {
+	desire.SpecStore
+	doneID desire.Identity
+}
+
+func (s *completedDeleteSpecStore) GetDeleteDesire(
+	ctx context.Context, id desire.Identity,
+) (desire.DeleteDesire, error) {
+	dd, err := s.SpecStore.GetDeleteDesire(ctx, id)
+	if err != nil {
+		return dd, err
+	}
+	if id == s.doneID {
+		dd.Status = deleted(desire.Status{}) // IsDeleted(dd.Status) == true
+	}
+	return dd, nil
+}
 
 // Testing error mapping scenarios
 
@@ -221,11 +243,67 @@ func TestDeleteReconcileAll(t *testing.T) {
 		}
 	})
 
-	t.Run("SucceedsWhenResourceAlreadyDeleted", func(t *testing.T) {
+	t.Run("SkipsAllApiserverCallsWhenDesireAlreadyRecordedDeleted", func(t *testing.T) {
 		testCtx := t.Context()
 
-		// Don't seed any resources - resource doesn't exist
+		// A live resource still exists on the cluster...
+		testDynamicClient := newFakeDynamicClient(t,
+			&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cm-done", Namespace: testNamespace}},
+		)
+
+		// ...but the re-check reports the desire already completed Deleted, so
+		// the guard must short-circuit before touching the apiserver at all -
+		// not even the GET. Fail on any action.
+		var apiCalled bool
+		testDynamicClient.PrependReactor("*", "*", func(k8stesting.Action) (bool, runtime.Object, error) {
+			apiCalled = true
+			return false, nil, nil // fall through to the default reactor
+		})
+
+		baseStore := memory.New()
+		id := desire.Identity{
+			Type:              desire.TypeDelete,
+			ManagementCluster: testManagementCluster,
+			Group:             "",
+			Resource:          configMapsType,
+			Namespace:         testNamespace,
+			Name:              "cm-done",
+		}
+		if _, err := baseStore.CreateDeleteDesire(testCtx, desire.DeleteDesire{
+			Identity: id, Owner: testOwner, Version: 1,
+		}); err != nil {
+			t.Fatalf("CreateDeleteDesire() error = %v", err)
+		}
+
+		dr := New(
+			&completedDeleteSpecStore{SpecStore: baseStore, doneID: id},
+			baseStore, testDynamicClient, testMapper, testManagementCluster, time.Hour,
+		)
+
+		if err := dr.reconcileAll(testCtx); err != nil {
+			t.Fatalf("reconcileAll() error = %v, should be nil", err)
+		}
+
+		if apiCalled {
+			t.Error("made an apiserver call for a desire already recorded Deleted; the re-check must skip it entirely")
+		}
+	})
+
+	t.Run("SucceedsWithoutDeleteCallWhenResourceAlreadyGone", func(t *testing.T) {
+		testCtx := t.Context()
+
+		// Don't seed any resources - the target is already gone from the
+		// cluster, so executeDelete's first GET returns NotFound.
 		testDynamicClient := newFakeDynamicClient(t)
+
+		// Fail loudly if a DELETE is ever issued: a resource confirmed absent
+		// on the first GET must short-circuit to ReasonDeleted without one.
+		var deleteIssued bool
+		testDynamicClient.PrependReactor("delete", "*", func(k8stesting.Action) (bool, runtime.Object, error) {
+			deleteIssued = true
+			return false, nil, nil // fall through to the default reactor
+		})
+
 		dr := New(testStore, testStore, testDynamicClient, testMapper, testManagementCluster, time.Hour)
 
 		testDesire := desire.DeleteDesire{
@@ -247,6 +325,10 @@ func TestDeleteReconcileAll(t *testing.T) {
 
 		if err = dr.reconcileAll(testCtx); err != nil {
 			t.Fatalf("reconcileAll() error = %v, should be nil", err)
+		}
+
+		if deleteIssued {
+			t.Error("DELETE was issued for an already-absent resource; first GET must short-circuit to Deleted")
 		}
 
 		updatedDesire, err := testStore.GetDeleteDesire(testCtx, testDesire.Identity)
@@ -314,7 +396,7 @@ func TestDeleteReconcileAll(t *testing.T) {
 		}
 	})
 
-	t.Run("SucceedsWhenResourceTypeDoesNotExist", func(t *testing.T) {
+	t.Run("PreCheckFailsWhenResourceTypeDoesNotExist", func(t *testing.T) {
 		testCtx := t.Context()
 
 		testDynamicClient := newFakeDynamicClient(t)
@@ -354,11 +436,11 @@ func TestDeleteReconcileAll(t *testing.T) {
 		if updatedDesire.Status.Conditions[0].Type != desire.TypeSuccessful {
 			t.Errorf("Condition 0: Type = %s, want Successful", updatedDesire.Status.Conditions[0].Type)
 		}
-		if updatedDesire.Status.Conditions[0].Status != metav1.ConditionTrue {
-			t.Errorf("Condition 0: Status = %s, want True", updatedDesire.Status.Conditions[0].Status)
+		if updatedDesire.Status.Conditions[0].Status != metav1.ConditionFalse {
+			t.Errorf("Condition 0: Status = %s, want False", updatedDesire.Status.Conditions[0].Status)
 		}
-		if updatedDesire.Status.Conditions[0].Reason != desire.ReasonDeleted {
-			t.Errorf("Condition 0: Reason = %s, want Deleted", updatedDesire.Status.Conditions[0].Reason)
+		if updatedDesire.Status.Conditions[0].Reason != desire.ReasonPreCheckFailed {
+			t.Errorf("Condition 0: Reason = %s, want PreCheckFailed", updatedDesire.Status.Conditions[0].Reason)
 		}
 	})
 

@@ -138,7 +138,7 @@ func (r *DeleteReconciler) reconcileAll(ctx context.Context) error {
 }
 
 // reconcileOne deletes a resource from the cluster and writes the resulting
-// condition back to the status store. It never touches the SpecStore.
+// condition back to the status store. It never mutates the SpecStore.
 //
 // ReasonDeleted means the resource is confirmed absent (404 on GET or successful
 // delete with no finalizers). ReasonWaitingForDeletion means the delete was
@@ -149,15 +149,25 @@ func (r *DeleteReconciler) reconcileOne(ctx context.Context, d desire.DeleteDesi
 	// Step 1: Pre-flight checks - resolve GVR, validate namespace
 	client, err := r.setupResourceClient(d.Identity)
 	if err != nil {
-		// Handle pre-check failures
-		if meta.IsNoMatchError(err) {
-			// Resource type doesn't exist (CRD uninstalled) - treat as deleted.
-			newStatus = deleted(d.Status)
-		} else {
-			// Mapping error, invalid namespace, etc.
-			newStatus = preCheckFailed(d.Status, err.Error())
-		}
+		newStatus = preCheckFailed(d.Status, err.Error())
 	} else {
+		// Re-check the desire hasn't already succeeded before deleting, to
+		// shrink the race window against a concurrent update completing the
+		// deletion before this pass executes.
+		dd, err := r.spec.GetDeleteDesire(ctx, d.Identity)
+		if err != nil {
+			return fmt.Errorf(
+				"delete: re-check desire %s: %w", util.DescribeIdentity(d.Identity), err,
+			)
+		}
+		if desire.IsDeleted(dd.Status) {
+			// Already completed successfully on a prior pass, nothing more to do.
+			slog.DebugContext(ctx, "delete: desire already completed, skipping",
+				"identity", d.Identity,
+			)
+			return nil
+		}
+
 		// Step 2: Execute the actual delete operation (GET → DELETE → GET)
 		newStatus, err = r.executeDelete(ctx, client, d)
 		if err != nil {

@@ -23,12 +23,10 @@ Per desire, `reconcileOne` performs a three-phase execution:
 
 1. **Pre-flight checks** (`setupResourceClient`):
    - Resolve GVK → GVR via the injected `meta.RESTMapper`. For `NoMatchError` (e.g., CRD
-     uninstalled), the controller resets the mapper and retries once. If it still fails, the
-     resource type doesn't exist → treat as successfully deleted (`ReasonDeleted`).
-   - Validate namespace configuration: namespace-scoped resources require a non-empty
-     `Identity.Namespace`; cluster-scoped resources ignore it. Invalid configuration →
-     `ReasonPreCheckFailed`.
-   - Other mapping errors → `ReasonPreCheckFailed` (no kube-apiserver call attempted).
+     absent), the controller resets the mapper and retries once. Any failure from
+     `setupResourceClient` - a `NoMatchError` that survives the retry, an invalid namespace, or any
+     other mapping error - is a precheck failure (`ReasonPreCheckFailed`), matching applydesire's and
+     readdesire's identical policy.
 
 2. **Execute delete** (`executeDelete` - GET → DELETE → GET flow):
    - **First GET:** Check if the resource exists. If `NotFound`, it's already deleted →
@@ -65,8 +63,7 @@ normal Go callers only.
 
 ## Special Cases
 
-- **NoMatchError (CRD uninstalled):** Treated as successfully deleted. If the resource type no
-  longer exists in the cluster, the deletion intent is satisfied.
+- **NoMatchError (CRD absent):**  This is treated is surfaced as `ReasonPreCheckFailed`
 - **Namespace-scoped vs cluster-scoped:** The controller configures the dynamic client correctly
   based on the REST mapper's scope information. Namespace-scoped resources (e.g., Pods) require
   `.Namespace(ns).Delete(name)`, while cluster-scoped (e.g., ClusterRoles) use `.Delete(name)` only.

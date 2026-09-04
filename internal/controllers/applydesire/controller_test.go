@@ -283,6 +283,22 @@ func (e *erroringSpecStore) ListApplyDesires(
 	return nil, e.listErr
 }
 
+// staleApplySpecStore makes the re-check GetApplyDesire report goneID as gone
+// (e.g. superseded by a DeleteDesire) after it was listed for this pass.
+type staleApplySpecStore struct {
+	desire.SpecStore
+	goneID desire.Identity
+}
+
+func (s *staleApplySpecStore) GetApplyDesire(
+	ctx context.Context, id desire.Identity,
+) (desire.ApplyDesire, error) {
+	if id == s.goneID {
+		return desire.ApplyDesire{}, desire.ErrNotFound
+	}
+	return s.SpecStore.GetApplyDesire(ctx, id)
+}
+
 type notifyingSpecLister struct {
 	called chan<- struct{}
 }
@@ -290,6 +306,10 @@ type notifyingSpecLister struct {
 func (n notifyingSpecLister) ListApplyDesires(context.Context, string) ([]desire.ApplyDesire, error) {
 	n.called <- struct{}{}
 	return nil, nil
+}
+
+func (n notifyingSpecLister) GetApplyDesire(context.Context, desire.Identity) (desire.ApplyDesire, error) {
+	return desire.ApplyDesire{}, desire.ErrNotFound
 }
 
 type conflictingStatusStore struct {
@@ -1261,6 +1281,44 @@ func TestReconcileAll_ManifestMissingNamespaceFallsBackToIdentityNamespace(t *te
 	c := findCondition(got.Status, desire.TypeSuccessful)
 	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != desire.ReasonApplied {
 		t.Errorf("condition = %+v, want Status=True Reason=%q", c, desire.ReasonApplied)
+	}
+}
+
+// TestReconcileAll_SkipsApplyWhenDesireGoneBeforeApply proves applyToCluster's
+// GetApplyDesire re-check prevents applying a desire that has already been
+// removed from the SpecStore (e.g. superseded by a DeleteDesire) by the time
+// the re-check runs, even though it was still present when ListApplyDesires
+// listed it for this pass: no SSA patch is issued and no status is written.
+func TestReconcileAll_SkipsApplyWhenDesireGoneBeforeApply(t *testing.T) {
+	ctx := t.Context()
+	dyn := newFakeDynamicClient(t) // no live object
+	store := memory.New()
+
+	id := applyIdentity("", "configmaps", defaultNamespace, "cm-gone")
+	seedApplyDesire(t, store, id, "owner-1",
+		newConfigMapContent(t, "cm-gone", defaultNamespace, map[string]string{"k": "v"}))
+
+	r := New(
+		&staleApplySpecStore{SpecStore: store, goneID: id},
+		store, dyn, newTestMapper(), testManagementCluster, time.Hour,
+	)
+
+	if err := r.reconcileAll(ctx); err != nil {
+		t.Fatalf("reconcileAll: %v", err)
+	}
+
+	// No SSA patch may be issued for a desire gone from the store.
+	if n := countApplyPatchActions(dyn.Actions(), configMapGVR); n != 0 {
+		t.Errorf("apply patch actions = %d, want 0: a desire gone before apply must not be applied", n)
+	}
+
+	// And no status may be written for the skipped desire.
+	got, err := store.GetApplyDesire(ctx, id)
+	if err != nil {
+		t.Fatalf("GetApplyDesire: %v", err)
+	}
+	if len(got.Status.Conditions) != 0 {
+		t.Errorf("status conditions = %d, want 0: a skipped desire must not get status", len(got.Status.Conditions))
 	}
 }
 

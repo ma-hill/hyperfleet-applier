@@ -34,6 +34,7 @@ const (
 // specLister is the read-only SpecStore surface the reconciler needs.
 type specLister interface {
 	ListApplyDesires(ctx context.Context, managementCluster string) ([]desire.ApplyDesire, error)
+	GetApplyDesire(ctx context.Context, id desire.Identity) (desire.ApplyDesire, error)
 }
 
 type statusWriter interface {
@@ -138,6 +139,14 @@ func (r *ApplyReconciler) reconcileAll(ctx context.Context) error {
 func (r *ApplyReconciler) reconcileOne(ctx context.Context, d desire.ApplyDesire) error {
 	newStatus, err := r.applyToCluster(ctx, d)
 	if err != nil {
+		if errors.Is(err, desire.ErrNotFound) {
+			// The ApplyDesire was removed (e.g. superseded by a DeleteDesire)
+			// between listing and applying; nothing to apply or record.
+			slog.DebugContext(ctx, "apply: desire deleted before apply, skipping",
+				"identity", d.Identity,
+			)
+			return nil
+		}
 		// Cancellation aborts the pass instead of writing status.
 		return err
 	}
@@ -160,8 +169,10 @@ func (r *ApplyReconciler) reconcileOne(ctx context.Context, d desire.ApplyDesire
 }
 
 // applyToCluster returns the status to persist and, separately, an error.
-// Only context cancellation returns a non-nil error; all other outcomes are
-// encoded as status conditions.
+// Context cancellation and GetApplyDesire-returned errors (the desire vanished from the
+// SpecStore before it could be applied) return a non-nil
+// error for reconcileOne to handle as control flow; all other outcomes are encoded as
+// status conditions.
 func (r *ApplyReconciler) applyToCluster(ctx context.Context, d desire.ApplyDesire) (desire.Status, error) {
 	obj := &unstructured.Unstructured{}
 	if err := json.Unmarshal(d.Spec.KubeContent, obj); err != nil {
@@ -197,9 +208,22 @@ func (r *ApplyReconciler) applyToCluster(ctx context.Context, d desire.ApplyDesi
 		resourceClient = ri.Namespace(d.Identity.Namespace)
 	}
 
+	// Re-check the desire still exists immediately before applying, to shrink
+	// the race window against a concurrent DeleteDesire removing it from the
+	// SpecStore after this desire was listed
+	if _, err := r.spec.GetApplyDesire(ctx, d.Identity); err != nil {
+		if errors.Is(err, desire.ErrNotFound) {
+			return desire.Status{}, fmt.Errorf(
+				"apply: desire %s deleted before apply: %w", util.DescribeIdentity(d.Identity), err,
+			)
+		}
+		return desire.Status{}, fmt.Errorf(
+			"apply: verify desire %s still exists: %w", util.DescribeIdentity(d.Identity), err,
+		)
+	}
+
 	applyCtx, cancel := context.WithTimeout(ctx, r.applyTimeout)
 	defer cancel()
-
 	if _, err := resourceClient.Apply(applyCtx, d.Identity.Name, obj, metav1.ApplyOptions{
 		FieldManager: fieldManager,
 		Force:        true,

@@ -176,27 +176,6 @@ func waitForDeleteReason(
 	return last
 }
 
-// waitForNotFound polls gvr/namespace/name on the live cluster until Get
-// reports NotFound, or ctx's deadline is hit. namespace is empty for
-// cluster-scoped resources.
-func waitForNotFound(t *testing.T, ctx context.Context, gvr schema.GroupVersionResource, namespace, name string) {
-	t.Helper()
-	var lastErr error
-	condition := func(ctx context.Context) (bool, error) {
-		var getErr error
-		if namespace == "" {
-			_, getErr = envDynamicClient.Resource(gvr).Get(ctx, name, metav1.GetOptions{})
-		} else {
-			_, getErr = envDynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
-		}
-		lastErr = getErr
-		return apierrors.IsNotFound(getErr), nil
-	}
-	if err := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true, condition); err != nil {
-		t.Fatalf("waiting for NotFound: %v (last Get error: %v)", err, lastErr)
-	}
-}
-
 // installWidgetCRD installs a "Widget" CRD at gvr/scope and registers a
 // cleanup that removes it - shared by the three controllers' CRD-installed-
 // after-mapper-cache-populated tests. Each caller passes its own gvr (a
